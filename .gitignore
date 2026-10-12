@@ -1,0 +1,33 @@
+# ─── Virtual Environment ──────────────────────────────────────────────────────
+# NEVER commit the venv — it's huge (~200MB) and machine-specific.
+# Each developer re-creates it by running: python -m venv .venv && pip install -r requirements.txt
+.venv/
+venv/
+env/
+
+# ─── Python Cache ─────────────────────────────────────────────────────────────
+# Python creates these when it imports a module. They're regenerated automatically.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ─── Environment Variables ────────────────────────────────────────────────────
+# .env files may contain API keys, passwords, secrets — NEVER commit them!
+.env
+.env.local
+.env.production
+
+# ─── ML Model Files (optional — they're big) ─────────────────────────────────
+# Uncomment if you want to exclude model files from git:
+# models_store/*.onnx
+
+# ─── Test & Coverage Output ───────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Editor Files ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
