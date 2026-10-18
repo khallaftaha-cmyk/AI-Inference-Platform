@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s      # How frequently Prometheus scrapes targets (default: 1m)
+  scrape_timeout: 10s       # How long to wait before timing out a scrape request
+  evaluation_interval: 15s  # How frequently rules and alerts are evaluated
+
+scrape_configs:
+  # Scrape job for our FastAPI inference application
+  - job_name: "ecg-inference-api"
+    metrics_path: "/metrics"
+    static_configs:
+      # "api" is the Docker Compose service name.
+      # Docker's internal DNS automatically resolves "api" to the container's IP address.
+      - targets: ["api:8000"]
+        labels:
+          environment: "production"
+          service: "ai-inference-platform"

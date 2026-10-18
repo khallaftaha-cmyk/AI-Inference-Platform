@@ -1,0 +1,21 @@
+# Ignore virtual environments
+.venv/
+venv/
+env/
+
+# Ignore Python cache & compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Ignore version control and IDE settings
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Ignore local env and test artifacts
+.env
+.env.local
+scratch/

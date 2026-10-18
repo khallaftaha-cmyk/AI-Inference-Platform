@@ -1,0 +1,47 @@
+services:
+
+  # ── Your FastAPI inference API ──────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: ecg-inference-api
+    ports:
+      - "8000:8000"                 # Host:8000 -> Container:8000
+    volumes:
+      - ./models_store:/app/models_store  # Mount model files directly into container
+    environment:
+      - CANARY_TRAFFIC_RATIO=0.0    # 0.0 = 100% stable v1; 0.2 = 20% canary v2
+    restart: unless-stopped
+
+  # ── Prometheus: Collects metrics from /metrics every 15 seconds ────────────
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: ecg-prometheus
+    ports:
+      - "9090:9090"                 # Prometheus UI at http://localhost:9090
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    restart: unless-stopped
+
+  # ── Grafana: Visualizes the metrics collected by Prometheus ────────────────
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ecg-grafana
+    ports:
+      - "3000:3000"                 # Grafana UI at http://localhost:3000
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin   # Login: admin / admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus                  # Ensure Prometheus starts before Grafana
+    restart: unless-stopped
+
+volumes:
+  grafana-data:                     # Preserves dashboards and preferences across restarts
