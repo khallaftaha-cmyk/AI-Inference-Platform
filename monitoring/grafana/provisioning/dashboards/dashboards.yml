@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+  - name: "AI Inference Platform"
+    orgId: 1
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      # This path maps to our volume mount in docker-compose.yml:
+      # ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      path: /etc/grafana/provisioning/dashboards/ai-inference
+      folder: "AI Inference Platform"
+      folderUid: "ai-inference-folder"

@@ -23,6 +23,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
+from app.core.validators import validate_ecg_signal
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,7 +79,8 @@ class PredictionResult(BaseModel):
         "confidence": 0.94,
         "probabilities": [0.94, 0.03, 0.02, 0.01],
         "model_version": "v1",
-        "patient_id": "patient-001"
+        "patient_id": "patient-001",
+        "validation_warnings": []
     }
     """
     predicted_class: int = Field(description="Index of the predicted class.")
@@ -85,6 +88,10 @@ class PredictionResult(BaseModel):
     probabilities: list[float] = Field(description="Probability for each class.")
     model_version: str = Field(description="Which model version made this prediction.")
     patient_id: Optional[str] = Field(default=None)
+    validation_warnings: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal data quality warnings (e.g., noisy leads, amplitude drift)."
+    )
 
 
 class HealthResponse(BaseModel):
@@ -212,20 +219,48 @@ def _run_inference(model, body: ECGPredictRequest) -> dict:
     """
     Shared inference logic used by both v1 and v2 endpoints.
 
-    Why extract this into a helper?
-      DRY principle — "Don't Repeat Yourself."
-      Both endpoints do the same numpy conversion + predict call.
-      Having it once means fixing a bug here fixes it for both.
+    Step-by-step:
+      1. Run data quality validation FIRST (before touching the model).
+         If the signal is fundamentally broken, reject it immediately.
+      2. Convert the list of lists → numpy array the model expects.
+      3. Run the ONNX model and get back predictions.
+      4. Return results + any quality warnings so the client knows.
+
+    Why return warnings in the response?
+      The client (e.g., a hospital system) should know that a prediction
+      was made on a potentially noisy or unusual signal. They can decide
+      whether to flag it for manual review.
     """
-    # Convert the list of lists → 3D numpy array: (batch, leads, samples)
+    # ── Step 1: Data quality validation ──────────────────────────────────────
+    validation = validate_ecg_signal(
+        signal=body.signal,
+        patient_id=body.patient_id,
+    )
+
+    # Hard block: if validation fails, return HTTP 422 (Unprocessable Entity)
+    # 422 means "we understood the request but the data is semantically wrong"
+    if not validation.is_valid:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "ECG signal failed data quality validation.",
+                "issues": validation.issues,
+                "hint": "Check signal shape (12 leads × 5000 samples), units (mV), and electrode connections."
+            }
+        )
+
+    # ── Step 2: Convert to numpy array ───────────────────────────────────────
     # np.array(body.signal)  → shape (num_leads, signal_length)
     # [np.newaxis, ...]      → shape (1, num_leads, signal_length) — adds batch dimension
     signal_array = np.array(body.signal, dtype=np.float32)[np.newaxis, ...]
-    # Now shape is (1, 12, 1000) — batch_size=1, 12 leads, 1000 samples
 
+    # ── Step 3: Run model inference ───────────────────────────────────────────
     try:
-        return model.predict(signal_array)
+        result = model.predict(signal_array)
     except Exception as e:
         logger.error(f"Inference failed: {e}", exc_info=True)
-        # 500 = "Internal Server Error"
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    # ── Step 4: Attach validation warnings to result ──────────────────────────
+    result["validation_warnings"] = validation.warnings
+    return result

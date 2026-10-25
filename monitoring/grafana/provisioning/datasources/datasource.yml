@@ -3,7 +3,14 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
-    access: proxy
+    # Setting uid to the literal string "DS_PROMETHEUS" lets the dashboard's
+    # ${DS_PROMETHEUS} template variable resolve automatically without any
+    # manual configuration in the Grafana UI.
+    uid: DS_PROMETHEUS
     url: http://prometheus:9090
+    access: proxy
     isDefault: true
-    editable: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"

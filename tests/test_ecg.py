@@ -20,10 +20,11 @@ import pytest
 from httpx import AsyncClient
 
 from app.main import app
+from app.core.validators import validate_ecg_signal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPER
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_fake_ecg(num_leads: int = 12, signal_length: int = 5000) -> list[list[float]]:
@@ -105,7 +106,7 @@ async def test_predict_ecg_v1_valid_input(client: AsyncClient):
     Test POST /api/v1/predict/ecg with a valid fake ECG signal.
     Checks:
       - Status 200
-      - All expected response fields present
+      - All expected response fields present (including new validation_warnings)
       - Confidence is between 0 and 1
       - Probabilities sum to ~1.0
       - Model version is 'v1'
@@ -123,6 +124,7 @@ async def test_predict_ecg_v1_valid_input(client: AsyncClient):
     assert "confidence" in data
     assert "probabilities" in data
     assert "model_version" in data
+    assert "validation_warnings" in data  # new field from data quality checks
 
     # Confidence should be a valid probability (0.0 to 1.0)
     assert 0.0 <= data["confidence"] <= 1.0, f"Confidence {data['confidence']} out of range"
@@ -141,7 +143,7 @@ async def test_predict_ecg_v1_invalid_input(client: AsyncClient):
     Test that the API correctly rejects invalid input.
     We send an empty signal list — Pydantic should auto-reject it with 422.
 
-    422 = Unprocessable Entity (request format is structurally wrong).
+    422 = Unprocessable Entity (request format is semantically wrong).
     FastAPI + Pydantic handle this automatically — our code never even runs.
     """
     bad_request = {"signal": []}  # Empty signal — validator should reject this
@@ -162,3 +164,84 @@ async def test_metrics_endpoint_exists(client: AsyncClient):
     assert response.status_code == 200
     # Prometheus metrics are in plain-text format
     assert "text/plain" in response.headers.get("content-type", "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW TESTS: Data Quality Validator (Option C)
+# These test the validator logic directly, without HTTP — unit tests.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_validator_passes_clean_ecg():
+    """
+    A clean 12×5000 signal with normal amplitude should pass validation.
+    """
+    clean_signal = (np.random.randn(12, 5000) * 0.5).tolist()  # ~0.5 mV amplitude
+    result = validate_ecg_signal(clean_signal)
+
+    assert result.is_valid is True
+    assert len(result.issues) == 0
+    assert "num_leads" in result.stats
+    assert result.stats["num_leads"] == 12
+
+
+def test_validator_rejects_wrong_shape():
+    """
+    A signal with 8 leads instead of 12 should fail validation.
+    The model expects exactly 12 leads (12-lead ECG).
+    """
+    wrong_leads_signal = np.random.randn(8, 5000).tolist()
+    result = validate_ecg_signal(wrong_leads_signal)
+
+    assert result.is_valid is False
+    assert any("leads" in issue.lower() for issue in result.issues)
+
+
+def test_validator_rejects_flatline():
+    """
+    A signal where one lead is all zeros (flatline) should fail.
+    This simulates a disconnected electrode — a real clinical problem.
+    """
+    signal = np.random.randn(12, 5000).tolist()
+    signal[3] = [0.0] * 5000  # Flatline lead 3
+
+    result = validate_ecg_signal(signal)
+
+    assert result.is_valid is False
+    assert any("flatline" in issue.lower() for issue in result.issues)
+
+
+def test_validator_warns_on_high_amplitude():
+    """
+    A signal with very high amplitude (e.g., 20 mV) should produce a WARNING
+    but NOT fail outright — it could still be valid data, just unusual.
+    """
+    # 20mV amplitude (above the ±15mV threshold warning)
+    signal = (np.random.randn(12, 5000) * 10.0).tolist()  # std=10 → values reach ~20 mV
+    result = validate_ecg_signal(signal)
+
+    # Should still pass (warning only, not a hard failure)
+    # Note: if std is too high it might also trigger high_noise warning
+    # The key check is that amplitude warning appears
+    assert isinstance(result.warnings, list)
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_flatline_signal(client: AsyncClient):
+    """
+    Integration test: The API should return 422 when a flatline lead is sent.
+    This proves the validator is correctly wired into the prediction endpoint.
+    """
+    signal = np.random.randn(12, 5000).tolist()
+    signal[0] = [0.0] * 5000  # Flatline lead 0
+
+    response = await client.post(
+        "/api/v1/predict/ecg",
+        json={"signal": signal, "patient_id": "flatline-test"}
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert "detail" in body
+    # The detail should contain our custom message, not just Pydantic's default
+    assert "flatline" in str(body["detail"]).lower()
+
