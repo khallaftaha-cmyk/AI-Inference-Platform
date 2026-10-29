@@ -3,7 +3,7 @@ main.py — The application entry point. Everything starts here.
 
 This file:
   1. Creates the FastAPI app instance.
-  2. Uses a "lifespan" function to load models at startup and clean up at shutdown.
+  2. Uses a "lifespan" function to initialize the ModelRegistry at startup.
   3. Includes the routers (URL handlers) we defined in routers/.
   4. Sets up Prometheus metrics collection.
   5. Configures logging.
@@ -11,7 +11,7 @@ This file:
 Startup sequence:
   uvicorn runs main.py
       → FastAPI app created
-      → lifespan() runs (models load into memory)
+      → lifespan() runs (ModelRegistry initializes, models load into memory)
       → Server starts accepting HTTP requests
       → Requests hit routers → routers call model runners → responses returned
 """
@@ -24,8 +24,8 @@ from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
-from app.models.ecg_runner import ECGModelRunner
-from app.routers import ecg
+from app.core.registry import ModelRegistry
+from app.routers import ecg, models
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING SETUP
@@ -35,7 +35,6 @@ from app.routers import ecg
 logging.basicConfig(
     level=logging.INFO,          # Show INFO, WARNING, ERROR, CRITICAL messages
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    # Example output: "2026-10-11 20:00:01 | INFO     | app.models.ecg_runner | [OK] Model loaded"
     handlers=[logging.StreamHandler(sys.stdout)]  # Print to terminal
 )
 
@@ -44,15 +43,6 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIFESPAN — Startup & Shutdown Logic
-#
-# Why lifespan instead of @app.on_event("startup")?
-#   FastAPI recommends the lifespan approach (Python 3.10+).
-#   It uses a context manager so startup and shutdown are in one function,
-#   making it cleaner and easier to reason about.
-#
-# The `yield` keyword splits the function in two:
-#   - Everything BEFORE yield = startup (runs when server starts)
-#   - Everything AFTER yield  = shutdown (runs when server stops)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -66,29 +56,22 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info("=" * 60)
 
-    # Load ECG model v1 and store it in app.state so all routes can access it.
-    # app.state is a simple namespace — you can attach any Python object to it.
-    # Routes access it via `request.app.state.ecg_model_v1`
-    logger.info("Loading ECG model v1...")
+    # Initialize the Dynamic Model Registry
+    logger.info("Initializing Model Registry...")
+    registry = ModelRegistry(models_dir=settings.MODELS_STORE_DIR)
+    app.state.model_registry = registry
+
+    # Pre-warm & load initial default model
+    logger.info("Loading default ECG model into registry...")
     try:
-        app.state.ecg_model_v1 = ECGModelRunner(
-            model_path=settings.ECG_MODEL_V1_PATH,
-            model_version="v1"
-        )
-    except FileNotFoundError as e:
+        model_v1 = registry.load_model("v1")
+        app.state.ecg_model_v1 = model_v1
+    except Exception as e:
         logger.error(f"[ERROR] Could not load model v1: {e}")
         app.state.ecg_model_v1 = None
 
-    # Load ECG model v2 (canary model — currently same file as v1).
-    logger.info("Loading ECG model v2 (canary)...")
-    try:
-        app.state.ecg_model_v2 = ECGModelRunner(
-            model_path=settings.ECG_MODEL_V2_PATH,
-            model_version="v2"
-        )
-    except FileNotFoundError as e:
-        logger.error(f"[ERROR] Could not load model v2: {e}")
-        app.state.ecg_model_v2 = None
+    # For backward-compatibility with canary route
+    app.state.ecg_model_v2 = app.state.ecg_model_v1
 
     logger.info("[OK] Startup complete. Server is ready.")
     logger.info("     API docs available at: http://localhost:8000/docs")
@@ -97,10 +80,10 @@ async def lifespan(app: FastAPI):
 
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
     logger.info("Shutting down... cleaning up resources.")
-    # In a real app, you'd close database connections, flush logs, etc. here.
     app.state.ecg_model_v1 = None
     app.state.ecg_model_v2 = None
-    logger.info("Goodbye! Goodbye!")
+    app.state.model_registry = None
+    logger.info("Goodbye!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,26 +95,16 @@ app = FastAPI(
     version=settings.APP_VERSION,
     description=(
         "Production-grade AI Inference Platform serving ECG classification models "
-        "with versioned endpoints, canary deployment, and Prometheus observability."
+        "with dynamic hot-reloading, canary deployment, and Prometheus observability."
     ),
-    # lifespan= wires up our startup/shutdown function defined above
     lifespan=lifespan,
-    # Where the auto-generated docs UI lives.
-    # Visit http://localhost:8000/docs to see a clickable UI for all endpoints!
     docs_url="/docs",
-    redoc_url="/redoc",  # Alternative docs UI
+    redoc_url="/redoc",
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMETHEUS METRICS
-#
-# This one line adds automatic tracking of:
-#   - Total request count (by endpoint, method, status code)
-#   - Request latency (in seconds, as a histogram)
-#
-# These metrics are exposed at GET /metrics in a format Prometheus can scrape.
-# We'll hook up Prometheus + Grafana in Phase 2 to visualize them.
 # ─────────────────────────────────────────────────────────────────────────────
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
@@ -139,26 +112,14 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INCLUDE ROUTERS
-#
-# "Including" a router = telling FastAPI "all endpoints defined in ecg.router
-# are now part of this app, prefixed with /api".
-#
-# So:
-#   ecg.router has  GET  /health
-#                   POST /v1/predict/ecg
-#                   POST /v2/predict/ecg
-#
-# After include_router, they become:
-#   GET  /api/health
-#   POST /api/v1/predict/ecg
-#   POST /api/v2/predict/ecg
 # ─────────────────────────────────────────────────────────────────────────────
 
 app.include_router(ecg.router, prefix=settings.API_PREFIX)
+app.include_router(models.router, prefix=settings.API_PREFIX)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROOT ENDPOINT — a simple welcome message
+# ROOT ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Root"])
@@ -169,4 +130,5 @@ async def root():
         "version": settings.APP_VERSION,
         "docs": "/docs",
         "health": "/api/health",
+        "models": "/api/models",
     }

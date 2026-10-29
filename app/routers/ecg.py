@@ -12,8 +12,10 @@ Key concepts:
       2. Generate OpenAPI documentation (the /docs page)
       3. Serialize response data to JSON
 
-  - Dependency Injection: The `request: Request` parameter FastAPI passes
-    automatically. We use this to access the app state (loaded models).
+  - Dynamic Model Resolution:
+    Predictions look up the currently active model from `request.app.state.model_registry`.
+    This enables zero-downtime hot swapping: changing the active model via the registry
+    immediately shifts production predictions without restarting the application.
 """
 
 import logging
@@ -29,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REQUEST & RESPONSE SCHEMAS (Pydantic Models)
-# These define exactly what JSON the API accepts and returns.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ECGPredictRequest(BaseModel):
@@ -42,22 +43,16 @@ class ECGPredictRequest(BaseModel):
         "patient_id": "patient-001"
     }
     """
-
-    # signal: a 2D list — num_leads rows × signal_length columns
-    # e.g., 12 rows × 1000 columns for a 12-lead, 1000-sample ECG
     signal: list[list[float]] = Field(
-        ...,  # "..." means this field is REQUIRED (no default)
+        ...,
         description="2D ECG signal: list of leads, each lead is a list of samples.",
     )
 
-    # Optional patient ID — for logging/tracking purposes.
     patient_id: Optional[str] = Field(
         default=None,
         description="Optional patient identifier for logging.",
     )
 
-    # Field validator: runs after the basic type check.
-    # Here we validate that the signal has at least 1 lead and 10 samples.
     @field_validator("signal")
     @classmethod
     def validate_signal(cls, v):
@@ -72,16 +67,6 @@ class ECGPredictRequest(BaseModel):
 class PredictionResult(BaseModel):
     """
     Defines what the API sends BACK to the client.
-
-    Example response:
-    {
-        "predicted_class": 0,
-        "confidence": 0.94,
-        "probabilities": [0.94, 0.03, 0.02, 0.01],
-        "model_version": "v1",
-        "patient_id": "patient-001",
-        "validation_warnings": []
-    }
     """
     predicted_class: int = Field(description="Index of the predicted class.")
     confidence: float = Field(description="Confidence score (0.0 to 1.0).")
@@ -99,6 +84,8 @@ class HealthResponse(BaseModel):
     status: str
     model_v1_loaded: bool
     model_v2_loaded: bool
+    active_model_version: Optional[str] = None
+    loaded_models_count: int = 0
     app_version: str
 
 
@@ -106,8 +93,6 @@ class HealthResponse(BaseModel):
 # ROUTER DEFINITION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# APIRouter groups these endpoints together.
-# "tags" just adds a label in the auto-generated /docs page.
 router = APIRouter(tags=["ECG Prediction"])
 
 
@@ -118,24 +103,21 @@ router = APIRouter(tags=["ECG Prediction"])
 @router.get("/health", response_model=HealthResponse)
 async def health_check(request: Request):
     """
-    Health check endpoint.
-
-    Why do we need this?
-      - Kubernetes, Docker, and load balancers call /health to check if
-        the app is running and models are loaded before sending real traffic.
-      - If a pod crashes or a model fails to load, /health returns a non-200
-        status and the orchestrator can restart the pod automatically.
-
-    `request.app.state` is where we store shared objects (like loaded models).
-    We set these up in main.py's lifespan function.
+    Health check endpoint: reports system liveness and model readiness.
     """
     state = request.app.state
     from app.core.config import settings
+
+    registry = getattr(state, "model_registry", None)
+    active_version = registry.active_version if registry else None
+    loaded_count = len(registry.loaded_versions) if registry else 0
 
     return HealthResponse(
         status="ok",
         model_v1_loaded=getattr(state, "ecg_model_v1", None) is not None,
         model_v2_loaded=getattr(state, "ecg_model_v2", None) is not None,
+        active_model_version=active_version,
+        loaded_models_count=loaded_count,
         app_version=settings.APP_VERSION,
     )
 
@@ -147,21 +129,22 @@ async def health_check(request: Request):
 @router.post("/v1/predict/ecg", response_model=PredictionResult)
 async def predict_ecg_v1(body: ECGPredictRequest, request: Request):
     """
-    Predict ECG class using model v1 (stable / production model).
+    Predict ECG class using the active production model.
 
-    How a request flows through this function:
-      1. Client sends POST /v1/predict/ecg with JSON body.
-      2. FastAPI deserializes JSON → ECGPredictRequest (Pydantic validates it).
-      3. We convert the 2D list to a numpy array.
-      4. We call the model runner's .predict() method.
-      5. We return a PredictionResult (Pydantic serializes it back to JSON).
+    Dynamic Model Resolution:
+      Pulls the active model from ModelRegistry. If a model was hot-swapped
+      live via /api/models/{version}/activate, this endpoint automatically uses it!
     """
-    model = getattr(request.app.state, "ecg_model_v1", None)
-    if model is None:
-        # 503 = "Service Unavailable" — the server is up but not ready.
-        raise HTTPException(status_code=503, detail="ECG model v1 is not loaded.")
+    registry = getattr(request.app.state, "model_registry", None)
+    if registry:
+        model = registry.get_active_model()
+    else:
+        model = getattr(request.app.state, "ecg_model_v1", None)
 
-    logger.info(f"[v1] Predicting for patient: {body.patient_id}")
+    if model is None:
+        raise HTTPException(status_code=503, detail="Active ECG model is not loaded.")
+
+    logger.info(f"[{model.model_version}] Predicting for patient: {body.patient_id}")
 
     result = _run_inference(model, body)
     return PredictionResult(**result, patient_id=body.patient_id)
@@ -174,26 +157,10 @@ async def predict_ecg_v1(body: ECGPredictRequest, request: Request):
 @router.post("/v2/predict/ecg", response_model=PredictionResult)
 async def predict_ecg_v2(body: ECGPredictRequest, request: Request):
     """
-    Canary endpoint: routes traffic between v1 and v2 based on the ratio.
-
-    What is a Canary Deployment?
-      Imagine you've trained a new model (v2). You don't want to switch all
-      1,000,000 daily predictions to v2 at once — what if it's worse?
-
-      So instead, you send:
-        - 90% of requests → v1 (old, trusted model)
-        - 10% of requests → v2 (new, candidate model)
-
-      You watch the metrics. If v2 looks good → increase to 50%, then 100%.
-      If v2 looks bad → set ratio back to 0%, no users were harmed.
-
-      This is "canary" because like a canary in a coal mine, you send a small
-      batch first to detect problems before they affect everyone.
+    Canary endpoint: routes a percentage of traffic to candidate v2 vs stable v1.
     """
     from app.core.config import settings
 
-    # random.random() returns a float between 0.0 and 1.0
-    # If CANARY_TRAFFIC_RATIO = 0.1, then 10% of the time we use v2.
     use_v2 = random.random() < settings.CANARY_TRAFFIC_RATIO
 
     if use_v2:
@@ -202,7 +169,8 @@ async def predict_ecg_v2(body: ECGPredictRequest, request: Request):
             raise HTTPException(status_code=503, detail="ECG model v2 is not loaded.")
         logger.info(f"[canary→v2] Predicting for patient: {body.patient_id}")
     else:
-        model = getattr(request.app.state, "ecg_model_v1", None)
+        registry = getattr(request.app.state, "model_registry", None)
+        model = registry.get_active_model() if registry else getattr(request.app.state, "ecg_model_v1", None)
         if model is None:
             raise HTTPException(status_code=503, detail="ECG model v1 is not loaded.")
         logger.info(f"[canary→v1] Predicting for patient: {body.patient_id}")
@@ -218,27 +186,13 @@ async def predict_ecg_v2(body: ECGPredictRequest, request: Request):
 def _run_inference(model, body: ECGPredictRequest) -> dict:
     """
     Shared inference logic used by both v1 and v2 endpoints.
-
-    Step-by-step:
-      1. Run data quality validation FIRST (before touching the model).
-         If the signal is fundamentally broken, reject it immediately.
-      2. Convert the list of lists → numpy array the model expects.
-      3. Run the ONNX model and get back predictions.
-      4. Return results + any quality warnings so the client knows.
-
-    Why return warnings in the response?
-      The client (e.g., a hospital system) should know that a prediction
-      was made on a potentially noisy or unusual signal. They can decide
-      whether to flag it for manual review.
     """
-    # ── Step 1: Data quality validation ──────────────────────────────────────
+    # Step 1: Data quality validation gate
     validation = validate_ecg_signal(
         signal=body.signal,
         patient_id=body.patient_id,
     )
 
-    # Hard block: if validation fails, return HTTP 422 (Unprocessable Entity)
-    # 422 means "we understood the request but the data is semantically wrong"
     if not validation.is_valid:
         raise HTTPException(
             status_code=422,
@@ -249,18 +203,16 @@ def _run_inference(model, body: ECGPredictRequest) -> dict:
             }
         )
 
-    # ── Step 2: Convert to numpy array ───────────────────────────────────────
-    # np.array(body.signal)  → shape (num_leads, signal_length)
-    # [np.newaxis, ...]      → shape (1, num_leads, signal_length) — adds batch dimension
+    # Step 2: Convert to numpy array with batch dimension (1, 12, 5000)
     signal_array = np.array(body.signal, dtype=np.float32)[np.newaxis, ...]
 
-    # ── Step 3: Run model inference ───────────────────────────────────────────
+    # Step 3: Run model inference
     try:
         result = model.predict(signal_array)
     except Exception as e:
         logger.error(f"Inference failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
-    # ── Step 4: Attach validation warnings to result ──────────────────────────
+    # Step 4: Attach validation warnings to result
     result["validation_warnings"] = validation.warnings
     return result

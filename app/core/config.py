@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     DEBUG: bool = False  # Set to True during development for extra logs
 
     # ── Model Paths ───────────────────────────────────────────────────────────
+    # Directory where all .onnx model files live
+    MODELS_STORE_DIR: str = str(BASE_DIR / "models_store")
+
     # This is the path to your real ECG ONNX model file.
     # We use BASE_DIR so it works no matter what folder you run the app from.
     ECG_MODEL_V1_PATH: str = str(BASE_DIR / "models_store" / "ecg_model_v1.onnx")
