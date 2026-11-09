@@ -1,0 +1,35 @@
+groups:
+  - name: ecg_platform_alerts
+    rules:
+      # Alert when data validation failure rate exceeds 5% over 5 minutes
+      - alert: ECGDataDriftDetected
+        expr: (sum(rate(ecg_validation_total{result="failed"}[5m])) / sum(rate(ecg_validation_total[5m]))) * 100 > 5
+        for: 1m
+        labels:
+          severity: warning
+          component: data_quality
+        annotations:
+          summary: "High ECG data validation failure rate (>5%)"
+          description: "Data validation failure rate is {{ $value | printf \"%.2f\" }}% over the last 5 minutes. Possible sensor degradation or input distribution shift."
+
+      # Alert when flatline leads surge (electrode disconnect)
+      - alert: ECGHighFlatlineRate
+        expr: sum(rate(ecg_quality_issues_total{issue_type="flatline_lead"}[5m])) > 0.1
+        for: 1m
+        labels:
+          severity: critical
+          component: electrodes
+        annotations:
+          summary: "Surge in disconnected ECG electrodes (flatline leads)"
+          description: "Flatline lead issues detected at rate of {{ $value | printf \"%.2f\" }}/s over 5 minutes."
+
+      # Alert when in-app DriftDetector gauge fires
+      - alert: ECGInAppDriftAlertActive
+        expr: ecg_drift_alert_active == 1
+        for: 30s
+        labels:
+          severity: critical
+          component: drift_engine
+        annotations:
+          summary: "In-App Drift Detector triggered an active alert"
+          description: "Current sliding-window validation failure rate has exceeded configured threshold."

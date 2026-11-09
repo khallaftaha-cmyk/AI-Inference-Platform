@@ -3,6 +3,9 @@ global:
   scrape_timeout: 10s       # How long to wait before timing out a scrape request
   evaluation_interval: 15s  # How frequently rules and alerts are evaluated
 
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
 scrape_configs:
   # Scrape job for our FastAPI inference application
   - job_name: "ecg-inference-api"

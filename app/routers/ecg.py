@@ -146,7 +146,7 @@ async def predict_ecg_v1(body: ECGPredictRequest, request: Request):
 
     logger.info(f"[{model.model_version}] Predicting for patient: {body.patient_id}")
 
-    result = _run_inference(model, body)
+    result = _run_inference(model, body, request)
     return PredictionResult(**result, patient_id=body.patient_id)
 
 
@@ -175,7 +175,7 @@ async def predict_ecg_v2(body: ECGPredictRequest, request: Request):
             raise HTTPException(status_code=503, detail="ECG model v1 is not loaded.")
         logger.info(f"[canary→v1] Predicting for patient: {body.patient_id}")
 
-    result = _run_inference(model, body)
+    result = _run_inference(model, body, request)
     return PredictionResult(**result, patient_id=body.patient_id)
 
 
@@ -183,7 +183,7 @@ async def predict_ecg_v2(body: ECGPredictRequest, request: Request):
 # HELPER FUNCTION (private)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_inference(model, body: ECGPredictRequest) -> dict:
+def _run_inference(model, body: ECGPredictRequest, request: Optional[Request] = None) -> dict:
     """
     Shared inference logic used by both v1 and v2 endpoints.
     """
@@ -192,6 +192,17 @@ def _run_inference(model, body: ECGPredictRequest) -> dict:
         signal=body.signal,
         patient_id=body.patient_id,
     )
+
+    # Step 2: Record in DriftDetector sliding window
+    if request:
+        detector = getattr(request.app.state, "drift_detector", None)
+        if detector:
+            detector.record_validation(
+                is_valid=validation.is_valid,
+                issues=validation.issues,
+                warnings=validation.warnings,
+                patient_id=body.patient_id,
+            )
 
     if not validation.is_valid:
         raise HTTPException(
